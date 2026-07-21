@@ -7,7 +7,11 @@ export class BaseBuffer {
   name: string;
   logger: ILogger;
   lockKey: string;
-  lockTimeout = 60;
+  // Lock TTL must comfortably exceed the maximum ClickHouse insert time
+  // (client request_timeout = 300s, insert max_execution_time = 300s). A
+  // shorter TTL can expire mid-flush, letting a second replica acquire the
+  // lock and concurrently flush the same queued events → duplicate inserts.
+  lockTimeout = 360;
   onFlush: () => void;
   enableParallelProcessing: boolean;
 

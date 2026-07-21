@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { getSafeJson } from '@openpanel/json';
 import { getRedisCache, publishEvent } from '@openpanel/redis';
 import { ch, chQuery } from '../clickhouse/client';
@@ -114,6 +115,14 @@ export class EventBuffer extends BaseBuffer {
     }
   }
 
+  /**
+   * Deterministic idempotency token for a chunk: the same chunk content on a
+   * retry produces the same token, so ClickHouse rejects the duplicate insert.
+   */
+  private deduplicationToken(events: IClickhouseEvent[]): string {
+    return createHash('sha256').update(JSON.stringify(events)).digest('hex');
+  }
+
   async processBuffer() {
     const redis = getRedisCache();
 
@@ -129,61 +138,73 @@ export class EventBuffer extends BaseBuffer {
         return;
       }
 
-      const eventsToClickhouse: IClickhouseEvent[] = [];
-      for (const eventStr of queueEvents) {
-        const event = getSafeJson<IClickhouseEvent>(eventStr);
-        if (event) {
-          if (!Array.isArray(event.groups)) {
-            event.groups = [];
+      const rawChunks = this.chunks(queueEvents, this.chunkSize);
+
+      this.logger.info('Inserting events into ClickHouse', {
+        totalEvents: queueEvents.length,
+        chunks: rawChunks.length,
+      });
+
+      // Process chunks in queue order. Each chunk is trimmed from the front of
+      // the queue only AFTER it is safely inserted. If a chunk insert throws,
+      // we stop: already-committed chunks stay trimmed and the untrimmed
+      // remainder is retried next cycle — committed chunks are never replayed
+      // (which would duplicate rows, since `events` has no dedup key).
+      let eventsProcessed = 0;
+      for (const rawChunk of rawChunks) {
+        const chunkEvents: IClickhouseEvent[] = [];
+        for (const eventStr of rawChunk) {
+          const event = getSafeJson<IClickhouseEvent>(eventStr);
+          if (event) {
+            if (!Array.isArray(event.groups)) {
+              event.groups = [];
+            }
+            chunkEvents.push(event);
           }
-          eventsToClickhouse.push(event);
+        }
+
+        chunkEvents.sort(
+          (a, b) =>
+            new Date(a.created_at || 0).getTime() -
+            new Date(b.created_at || 0).getTime()
+        );
+
+        if (chunkEvents.length > 0) {
+          await ch.insert({
+            table: 'events',
+            values: chunkEvents,
+            format: 'JSONEachRow',
+            clickhouse_settings: {
+              insert_deduplication_token: this.deduplicationToken(chunkEvents),
+            },
+          });
+        }
+
+        // Commit this chunk: remove exactly the raw entries we just processed.
+        await redis
+          .multi()
+          .ltrim(this.queueKey, rawChunk.length, -1)
+          .decrby(this.bufferCounterKey, rawChunk.length)
+          .exec();
+
+        if (chunkEvents.length > 0) {
+          const countByProject = new Map<string, number>();
+          for (const event of chunkEvents) {
+            countByProject.set(
+              event.project_id,
+              (countByProject.get(event.project_id) ?? 0) + 1
+            );
+          }
+          for (const [projectId, count] of countByProject) {
+            publishEvent('events', 'batch', { projectId, count });
+          }
+          eventsProcessed += chunkEvents.length;
         }
       }
 
-      if (eventsToClickhouse.length === 0) {
-        this.logger.debug('No valid events to process');
-        return;
-      }
-
-      eventsToClickhouse.sort(
-        (a, b) =>
-          new Date(a.created_at || 0).getTime() -
-          new Date(b.created_at || 0).getTime()
-      );
-
-      this.logger.info('Inserting events into ClickHouse', {
-        totalEvents: eventsToClickhouse.length,
-        chunks: Math.ceil(eventsToClickhouse.length / this.chunkSize),
-      });
-
-      for (const chunk of this.chunks(eventsToClickhouse, this.chunkSize)) {
-        await ch.insert({
-          table: 'events',
-          values: chunk,
-          format: 'JSONEachRow',
-        });
-      }
-
-      const countByProject = new Map<string, number>();
-      for (const event of eventsToClickhouse) {
-        countByProject.set(
-          event.project_id,
-          (countByProject.get(event.project_id) ?? 0) + 1
-        );
-      }
-      for (const [projectId, count] of countByProject) {
-        publishEvent('events', 'batch', { projectId, count });
-      }
-
-      await redis
-        .multi()
-        .ltrim(this.queueKey, queueEvents.length, -1)
-        .decrby(this.bufferCounterKey, queueEvents.length)
-        .exec();
-
       this.logger.info('Processed events from Redis buffer', {
         batchSize: this.batchSize,
-        eventsProcessed: eventsToClickhouse.length,
+        eventsProcessed,
       });
     } catch (error) {
       this.logger.error('Error processing Redis buffer', { error });
